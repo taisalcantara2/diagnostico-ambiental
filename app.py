@@ -232,7 +232,8 @@ button[kind="primary"] {
 # ─────────────────────────────────────────────
 # CONSTANTES / ENDPOINTS
 # ─────────────────────────────────────────────
-SICAR_WFS = "https://car.gov.br/geoserver/wfs"
+SICAR_WFS      = "https://geoserver.car.gov.br/geoserver/sicar/wfs"
+SICAR_PUBL_URL = "https://www.car.gov.br/publico/imoveis/index"
 PRODES_WFS = "https://terrabrasilis.dpi.inpe.br/geoserver/prodes-amz-nb/wfs"
 DETER_WFS  = "https://terrabrasilis.dpi.inpe.br/geoserver/deter-amz/wfs"
 FOCOS_WFS = "https://terrabrasilis.dpi.inpe.br/geoserver/bdqueimadas-light/wfs"
@@ -254,14 +255,21 @@ DETER_CLASSES = {
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def buscar_imovel_car(codigo_car: str):
-    """Busca geometria e atributos do imóvel via SICAR WFS."""
+    """
+    Busca geometria e atributos do imóvel via SICAR WFS.
+    Tenta 3 estratégias em sequência:
+      1. geoserver.car.gov.br  camada sicar:sicar_imoveis_pa  (endpoint correto)
+      2. Mesmo endpoint, filtro LIKE (tolerância a variações)
+      3. API pública car.gov.br/publico  (fallback REST)
+    """
     codigo_car = codigo_car.strip().upper()
 
+    # ── Estratégia 1: WFS geoserver.car.gov.br, camada por estado ──
     params = {
         "service": "WFS",
         "version": "2.0.0",
         "request": "GetFeature",
-        "typeNames": "car:area_imovel",
+        "typeNames": "sicar:sicar_imoveis_pa",
         "outputFormat": "application/json",
         "CQL_FILTER": f"cod_imovel='{codigo_car}'",
         "maxFeatures": "1",
@@ -275,7 +283,7 @@ def buscar_imovel_car(codigo_car: str):
     except Exception:
         pass
 
-    # Fallback: busca por parte do código
+    # ── Estratégia 2: mesmo WFS, filtro LIKE (tolerância a variações) ──
     params["CQL_FILTER"] = f"cod_imovel LIKE '%{codigo_car}%'"
     try:
         r = requests.get(SICAR_WFS, params=params, timeout=30)
@@ -285,6 +293,25 @@ def buscar_imovel_car(codigo_car: str):
             return gpd.GeoDataFrame.from_features(data["features"], crs="EPSG:4674")
     except Exception:
         pass
+
+    # ── Estratégia 3: API REST pública do portal CAR ──
+    try:
+        url = f"https://www.car.gov.br/publico/imoveis/shapefile?id={codigo_car}"
+        r = requests.get(url, timeout=30, allow_redirects=True)
+        if r.ok and r.headers.get("Content-Type", "").startswith("application/"):
+            import zipfile, io, tempfile, os
+            z = zipfile.ZipFile(io.BytesIO(r.content))
+            tmpdir = tempfile.mkdtemp()
+            z.extractall(tmpdir)
+            shps = [f for f in os.listdir(tmpdir) if f.endswith(".shp")]
+            if shps:
+                gdf = gpd.read_file(os.path.join(tmpdir, shps[0]))
+                if gdf.crs is None:
+                    gdf = gdf.set_crs("EPSG:4674")
+                return gdf.to_crs("EPSG:4674")
+    except Exception:
+        pass
+
     return None
 
 
