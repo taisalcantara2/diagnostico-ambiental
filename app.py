@@ -23,6 +23,9 @@ import json
 import re
 from datetime import datetime, date
 import warnings
+import ssl
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings("ignore")
 
 # ─────────────────────────────────────────────
@@ -233,6 +236,31 @@ button[kind="primary"] {
 # CONSTANTES / ENDPOINTS
 # ─────────────────────────────────────────────
 SICAR_WFS      = "https://geoserver.car.gov.br/geoserver/sicar/wfs"
+
+# Mapa UF → sufixo da camada SICAR
+_UF_LAYER = {
+    "AC":"ac","AL":"al","AM":"am","AP":"ap","BA":"ba","CE":"ce","DF":"df",
+    "ES":"es","GO":"go","MA":"ma","MG":"mg","MS":"ms","MT":"mt","PA":"pa",
+    "PB":"pb","PE":"pe","PI":"pi","PR":"pr","RJ":"rj","RN":"rn","RO":"ro",
+    "RR":"rr","RS":"rs","SC":"sc","SE":"se","SP":"sp","TO":"to",
+}
+
+class _LegacyTLSAdapter(requests.adapters.HTTPAdapter):
+    """Adapter que aceita TLS legado do servidor SICAR."""
+    def init_poolmanager(self, *args, **kwargs):
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode    = ssl.CERT_NONE
+        ctx.set_ciphers("DEFAULT:@SECLEVEL=0")
+        ctx.options &= ~getattr(ssl, "OP_NO_TLSv1",   0)
+        ctx.options &= ~getattr(ssl, "OP_NO_TLSv1_1", 0)
+        kwargs["ssl_context"] = ctx
+        super().init_poolmanager(*args, **kwargs)
+
+def _sicar_session():
+    s = requests.Session()
+    s.mount("https://", _LegacyTLSAdapter())
+    return s
 SICAR_PUBL_URL = "https://www.car.gov.br/publico/imoveis/index"
 PRODES_WFS = "https://terrabrasilis.dpi.inpe.br/geoserver/prodes-amz-nb/wfs"
 DETER_WFS  = "https://terrabrasilis.dpi.inpe.br/geoserver/deter-amz/wfs"
@@ -253,59 +281,62 @@ DETER_CLASSES = {
 # FUNÇÕES DE BUSCA
 # ─────────────────────────────────────────────
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=1800, show_spinner=False)
 def buscar_imovel_car(codigo_car: str):
     """
-    Busca geometria e atributos do imóvel via SICAR WFS.
-    Tenta 3 estratégias em sequência:
-      1. geoserver.car.gov.br  camada sicar:sicar_imoveis_pa  (endpoint correto)
-      2. Mesmo endpoint, filtro LIKE (tolerância a variações)
-      3. API pública car.gov.br/publico  (fallback REST)
+    Consulta WFS SICAR com adaptador TLS legado — padrão comprovado em produção.
+    Usa version=1.0.0, typeName (sem 's'), filtro XML OGC e verify=False.
+    Fallback para GML2 se o servidor não retornar JSON.
     """
-    codigo_car = codigo_car.strip().upper()
+    cod = codigo_car.strip().upper()
 
-    # ── Estratégia 1: WFS geoserver.car.gov.br, camada por estado ──
+    # Detecta UF pelo prefixo do código (ex: PA-...)
+    uf = cod.split("-")[0] if "-" in cod else "PA"
+    layer = f"sicar:sicar_imoveis_{_UF_LAYER.get(uf, 'pa')}"
+
+    filter_xml = (
+        "<Filter>"
+        "<PropertyIsEqualTo>"
+        "<PropertyName>cod_imovel</PropertyName>"
+        f"<Literal>{cod}</Literal>"
+        "</PropertyIsEqualTo>"
+        "</Filter>"
+    )
+
     params = {
         "service": "WFS",
-        "version": "2.0.0",
+        "version": "1.0.0",
         "request": "GetFeature",
-        "typeNames": "sicar:sicar_imoveis_pa",
+        "typeName": layer,
         "outputFormat": "application/json",
-        "CQL_FILTER": f"cod_imovel='{codigo_car}'",
         "maxFeatures": "1",
+        "FILTER": filter_xml,
     }
+
+    session = _sicar_session()
+
+    # ── Tentativa 1: JSON ──────────────────────────────────────────────────
     try:
-        r = requests.get(SICAR_WFS, params=params, timeout=30)
-        r.raise_for_status()
-        data = r.json()
-        if data.get("features"):
-            return gpd.GeoDataFrame.from_features(data["features"], crs="EPSG:4674")
+        r = session.get(SICAR_WFS, params=params, timeout=40, verify=False)
+        if r.status_code == 200 and r.text.strip():
+            ctype = r.headers.get("Content-Type", "")
+            if "json" in ctype or r.text.strip().startswith("{"):
+                data = r.json()
+                if data.get("features"):
+                    return gpd.GeoDataFrame.from_features(
+                        data["features"], crs="EPSG:4674"
+                    )
     except Exception:
         pass
 
-    # ── Estratégia 2: mesmo WFS, filtro LIKE (tolerância a variações) ──
-    params["CQL_FILTER"] = f"cod_imovel LIKE '%{codigo_car}%'"
+    # ── Tentativa 2: GML2 (fallback quando servidor não retorna JSON) ──────
     try:
-        r = requests.get(SICAR_WFS, params=params, timeout=30)
-        r.raise_for_status()
-        data = r.json()
-        if data.get("features"):
-            return gpd.GeoDataFrame.from_features(data["features"], crs="EPSG:4674")
-    except Exception:
-        pass
-
-    # ── Estratégia 3: API REST pública do portal CAR ──
-    try:
-        url = f"https://www.car.gov.br/publico/imoveis/shapefile?id={codigo_car}"
-        r = requests.get(url, timeout=30, allow_redirects=True)
-        if r.ok and r.headers.get("Content-Type", "").startswith("application/"):
-            import zipfile, io, tempfile, os
-            z = zipfile.ZipFile(io.BytesIO(r.content))
-            tmpdir = tempfile.mkdtemp()
-            z.extractall(tmpdir)
-            shps = [f for f in os.listdir(tmpdir) if f.endswith(".shp")]
-            if shps:
-                gdf = gpd.read_file(os.path.join(tmpdir, shps[0]))
+        params_gml = {**params, "outputFormat": "GML2"}
+        r = session.get(SICAR_WFS, params=params_gml, timeout=40, verify=False)
+        if r.status_code == 200 and r.text.strip() and "<gml:" in r.text:
+            import io as _io
+            gdf = gpd.read_file(_io.StringIO(r.text))
+            if not gdf.empty:
                 if gdf.crs is None:
                     gdf = gdf.set_crs("EPSG:4674")
                 return gdf.to_crs("EPSG:4674")
@@ -700,6 +731,14 @@ if buscar and codigo_car.strip():
 
     if gdf_imovel is None or gdf_imovel.empty:
         st.error("❌ Imóvel não encontrado. Verifique o código CAR e tente novamente.")
+        st.warning(
+            f"**Código consultado:** `{codigo_car}`\n\n"
+            "**Possíveis causas:**\n"
+            "- Código digitado com erro (verifique hífens e letras)\n"
+            "- Imóvel ainda não publicado no SICAR federal\n"
+            "- Serviço SICAR temporariamente indisponível\n\n"
+            "💡 Confirme o código em: https://www.car.gov.br/publico/imoveis/index"
+        )
         st.stop()
 
     info = extrair_info_imovel(gdf_imovel)
