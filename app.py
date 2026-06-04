@@ -348,65 +348,114 @@ def buscar_imovel_car(codigo_car: str):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def buscar_prodes(bbox_wkt: str, geom_json: str):
-    """Busca incrementos PRODES dentro do bbox do imóvel."""
-    bbox = bbox_wkt  # "minx,miny,maxx,maxy"
-    params = {
-        "service": "WFS",
-        "version": "2.0.0",
-        "request": "GetFeature",
-        "typeNames": "prodes-amz-nb:yearly_deforestation_biome",
-        "outputFormat": "application/json",
-        "bbox": f"{bbox},EPSG:4674",
-        "maxFeatures": "5000",
-    }
-    try:
-        r = requests.get(PRODES_WFS, params=params, timeout=45)
-        r.raise_for_status()
-        data = r.json()
-        if data.get("features"):
-            gdf = gpd.GeoDataFrame.from_features(data["features"], crs="EPSG:4674")
-            # Intersecção real com o polígono do imóvel
+    """
+    Busca incrementos PRODES via WFS TerraBrasilis.
+    - typeName sem prefixo de workspace (padrão documentado pelo INPE)
+    - bbox convertido para EPSG:4326 (o servidor rejeita 4674 no bbox)
+    - usa _sicar_session() para tolerância TLS
+    - intersecção real com o polígono do imóvel após download
+    """
+    # Converte bbox de 4674 → 4326 para a query
+    minx, miny, maxx, maxy = [float(v) for v in bbox_wkt.split(",")]
+    # EPSG:4674 e EPSG:4326 têm coordenadas praticamente idênticas
+    # (SIRGAS 2000 ≈ WGS84), mas declarar 4326 evita rejeição do servidor
+    bbox_4326 = f"{minx},{miny},{maxx},{maxy},EPSG:4326"
+
+    # Tenta duas camadas conhecidas (o nome pode variar por versão do servidor)
+    camadas = [
+        "prodes-amz-nb:yearly_deforestation_biome",
+        "yearly_deforestation_biome",
+        "prodes-amz-nb:prodes_amz_yearly_deforestation_biome",
+    ]
+    session = _sicar_session()
+
+    for camada in camadas:
+        params = {
+            "service": "WFS",
+            "version": "1.1.0",
+            "request": "GetFeature",
+            "typeName": camada,
+            "outputFormat": "application/json",
+            "bbox": bbox_4326,
+            "maxFeatures": "5000",
+        }
+        try:
+            r = session.get(PRODES_WFS, params=params, timeout=60, verify=False)
+            if r.status_code != 200 or not r.text.strip():
+                continue
+            data = r.json()
+            features = data.get("features", [])
+            if not features:
+                continue
+            gdf = gpd.GeoDataFrame.from_features(features)
+            if gdf.crs is None:
+                gdf = gdf.set_crs("EPSG:4674")
+            else:
+                gdf = gdf.to_crs("EPSG:4674")
             imovel_geom = gpd.GeoDataFrame(
                 geometry=[shape(json.loads(geom_json))], crs="EPSG:4674"
             )
-            gdf = gdf.to_crs("EPSG:4674")
             result = gpd.overlay(gdf, imovel_geom, how="intersection")
             if not result.empty:
                 result["area_ha"] = result.geometry.to_crs("EPSG:32722").area / 10000
             return result
-    except Exception:
-        pass
+        except Exception:
+            continue
+
     return gpd.GeoDataFrame()
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def buscar_deter(bbox_wkt: str, geom_json: str):
-    """Busca alertas DETER dentro do bbox do imóvel."""
-    params = {
-        "service": "WFS",
-        "version": "2.0.0",
-        "request": "GetFeature",
-        "typeNames": "deter-amz:deter_public",
-        "outputFormat": "application/json",
-        "bbox": f"{bbox_wkt},EPSG:4674",
-        "maxFeatures": "5000",
-    }
-    try:
-        r = requests.get(DETER_WFS, params=params, timeout=45)
-        r.raise_for_status()
-        data = r.json()
-        if data.get("features"):
-            gdf = gpd.GeoDataFrame.from_features(data["features"], crs="EPSG:4674")
+    """
+    Busca alertas DETER via WFS TerraBrasilis.
+    - typeName=deter_public (sem prefixo, conforme documentação INPE)
+    - bbox em EPSG:4326
+    - usa _sicar_session() para tolerância TLS
+    """
+    minx, miny, maxx, maxy = [float(v) for v in bbox_wkt.split(",")]
+    bbox_4326 = f"{minx},{miny},{maxx},{maxy},EPSG:4326"
+
+    camadas = [
+        "deter-amz:deter_public",
+        "deter_public",
+        "deter-amz:deter_amz",
+    ]
+    session = _sicar_session()
+
+    for camada in camadas:
+        params = {
+            "service": "WFS",
+            "version": "1.1.0",
+            "request": "GetFeature",
+            "typeName": camada,
+            "outputFormat": "application/json",
+            "bbox": bbox_4326,
+            "maxFeatures": "5000",
+        }
+        try:
+            r = session.get(DETER_WFS, params=params, timeout=60, verify=False)
+            if r.status_code != 200 or not r.text.strip():
+                continue
+            data = r.json()
+            features = data.get("features", [])
+            if not features:
+                continue
+            gdf = gpd.GeoDataFrame.from_features(features)
+            if gdf.crs is None:
+                gdf = gdf.set_crs("EPSG:4674")
+            else:
+                gdf = gdf.to_crs("EPSG:4674")
             imovel_geom = gpd.GeoDataFrame(
                 geometry=[shape(json.loads(geom_json))], crs="EPSG:4674"
             )
-            gdf = gdf.to_crs("EPSG:4674")
             result = gpd.overlay(gdf, imovel_geom, how="intersection")
             if not result.empty:
                 result["area_ha"] = result.geometry.to_crs("EPSG:32722").area / 10000
             return result
-    except Exception:
-        pass
+        except Exception:
+            continue
+
     return gpd.GeoDataFrame()
 
 
@@ -414,33 +463,52 @@ def buscar_deter(bbox_wkt: str, geom_json: str):
 def buscar_focos(bbox_wkt: str, geom_json: str):
     """
     Busca focos de calor via WFS TerraBrasilis (bdqueimadas-light).
-    Filtra pelo bbox do imóvel e faz interseção espacial exata (sjoin)
-    com o polígono do CAR — mesma lógica de PRODES e DETER.
+    - typeName sem prefixo
+    - bbox em EPSG:4326
+    - sjoin (pontos dentro do polígono do imóvel)
+    - usa _sicar_session() para tolerância TLS
     """
-    params = {
-        "service": "WFS",
-        "version": "2.0.0",
-        "request": "GetFeature",
-        "typeNames": "bdqueimadas-light:focos_de_calor",
-        "outputFormat": "application/json",
-        "bbox": f"{bbox_wkt},EPSG:4674",
-        "maxFeatures": "50000",
-    }
-    try:
-        r = requests.get(FOCOS_WFS, params=params, timeout=60)
-        r.raise_for_status()
-        data = r.json()
-        if data.get("features"):
-            gdf = gpd.GeoDataFrame.from_features(data["features"], crs="EPSG:4674")
+    minx, miny, maxx, maxy = [float(v) for v in bbox_wkt.split(",")]
+    bbox_4326 = f"{minx},{miny},{maxx},{maxy},EPSG:4326"
+
+    camadas = [
+        "bdqueimadas-light:focos_de_calor",
+        "focos_de_calor",
+    ]
+    session = _sicar_session()
+
+    for camada in camadas:
+        params = {
+            "service": "WFS",
+            "version": "1.1.0",
+            "request": "GetFeature",
+            "typeName": camada,
+            "outputFormat": "application/json",
+            "bbox": bbox_4326,
+            "maxFeatures": "50000",
+        }
+        try:
+            r = session.get(FOCOS_WFS, params=params, timeout=60, verify=False)
+            if r.status_code != 200 or not r.text.strip():
+                continue
+            data = r.json()
+            features = data.get("features", [])
+            if not features:
+                continue
+            gdf = gpd.GeoDataFrame.from_features(features)
+            if gdf.crs is None:
+                gdf = gdf.set_crs("EPSG:4674")
+            else:
+                gdf = gdf.to_crs("EPSG:4674")
             imovel_geom = gpd.GeoDataFrame(
                 geometry=[shape(json.loads(geom_json))], crs="EPSG:4674"
             )
-            gdf = gdf.to_crs("EPSG:4674")
-            # Focos são pontos — usa sjoin em vez de overlay
+            # Focos são pontos — sjoin em vez de overlay
             result = gpd.sjoin(gdf, imovel_geom, how="inner", predicate="within")
             return result
-    except Exception:
-        pass
+        except Exception:
+            continue
+
     return gpd.GeoDataFrame()
 
 
